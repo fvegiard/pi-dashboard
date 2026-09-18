@@ -1,0 +1,55 @@
+# Binary executables (pre-built distribution)
+*.exe
+*.dll
+*.pak
+*.dat
+*.bin
+
+# Application resources (generated/packaged)
+*.asar
+resources.pak
+snapshot_blob.bin
+v8_context_snapshot.bin
+
+# Localization (generated)
+locales/
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.local
+
+# Node modules (if development)
+node_modules/
+dist/
+build/
+
+# Git LFS (if used)
+*.exe.lfs
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+Thumbs.db
+.DS_Store
