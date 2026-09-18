@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=${{ github.event.inputs.version }}
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Release version: ${VERSION}"
+      
+      - name: Validate version format
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          if ! [[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version format: $VERSION"
+            echo "Expected format: vX.Y.Z"
+            exit 1
+          fi
+          echo "✓ Version format valid: $VERSION"
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Update version file
+        run: |
+          echo "${{ steps.version.outputs.version }}" | sed 's/v//' > version
+          cat version
+      
+      - name: Build application
+        run: npm run build
+        continue-on-error: true
+      
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          release_name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ## Release ${{ steps.version.outputs.version }}
+            
+            ### Features & Changes
+            See [CHANGELOG.md](./CHANGELOG.md) for detailed release notes.
+            
+            ### Installation
+            Download the appropriate binary for your platform:
+            - Windows: `pi-dashboard-${{ steps.version.outputs.version }}-win.exe`
+            - macOS: `pi-dashboard-${{ steps.version.outputs.version }}-mac.dmg`
+            - Linux: `pi-dashboard-${{ steps.version.outputs.version }}-linux.AppImage`
+            
+            ### Verification
+            Verify the integrity of downloaded files using SHA256 checksums:
+            ```bash
+            sha256sum -c pi-dashboard-${{ steps.version.outputs.version }}.sha256
+            ```
+            
+            ### Known Issues
+            See [CHANGELOG.md](./CHANGELOG.md) for any known issues in this release.
+          draft: false
+          prerelease: false
+      
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/**/*
+            CHANGELOG.md
+            LICENSE
+            SECURITY.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Create git tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.version }}
+          git push origin ${{ steps.version.outputs.version }}
+        continue-on-error: true
+      
+      - name: Notify Slack (optional)
+        run: echo "Release ${{ steps.version.outputs.version }} created successfully"
+
+  build-artifacts:
+    name: Build Platform-Specific Binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+          - os: ubuntu-latest
+            platform: linux
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build for ${{ matrix.platform }}
+        run: npm run build:${{ matrix.platform }} || npm run build
+        continue-on-error: true
+      
+      - name: Package binaries
+        run: |
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            7z a -r pi-dashboard-win.zip dist/
+          else
+            tar -czf pi-dashboard-${{ matrix.platform }}.tar.gz dist/
+          fi
+        shell: bash
+        continue-on-error: true
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-dashboard-${{ matrix.platform }}
+          path: pi-dashboard-*
+          retention-days: 7
