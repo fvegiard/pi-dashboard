@@ -1,0 +1,307 @@
+/**
+ * Auto-start logic for the dashboard server.
+ * Uses mDNS discovery first, falls back to health check, then auto-starts.
+ */
+import { getDashboardServerLogPath } from "@blackbelt-technology/pi-dashboard-shared/dashboard-paths.js";
+import { SPAWN_READINESS_BUDGET_MS } from "@blackbelt-technology/pi-dashboard-shared/config.js";
+import { appendAutoStartLog, shouldRefuseWorktreeAutoStart } from "./autostart-guard.js";
+import {
+  acquireAutoStartLock,
+  autoStartLockPath,
+  defaultProbes,
+  type LockProbes,
+  readLock,
+  recordChildPid,
+  releaseAutoStartLock,
+} from "./autostart-lock.js";
+import { resolveServerCliPath } from "./server-launcher.js";
+
+export interface DiscoveredServer {
+  host: string;
+  port: number;
+  piPort: number;
+  isLocal: boolean;
+  source: "mdns" | "fallback";
+}
+
+export interface AutoStartDeps {
+  discoverDashboard: (timeout?: number) => Promise<DiscoveredServer[]>;
+  isDashboardRunning: (port: number) => Promise<{ running: boolean; portConflict?: boolean }>;
+  launchServer: (config: any) => Promise<{ success: boolean; message: string; childPid?: number; logOwned?: boolean }>;
+  notify: (message: string, level: "info" | "warning") => void;
+  /**
+   * Optional callback fired immediately BEFORE `launchServer(config)` is
+   * invoked. Used by TUI-aware callers (bridge extension) to show a
+   * "starting dashboard server" spinner. NOT fired during mDNS discovery
+   * or health-check phases — only when an actual server process is
+   * about to be spawned.
+   */
+  onLaunchStart?: () => void;
+  /**
+   * Optional callback fired after `launchServer` resolves (success or
+   * failure), AND after the post-launch mDNS re-discovery + recheck.
+   * Passes the final success state so the caller can clear spinners.
+   */
+  onLaunchEnd?: (success: boolean) => void;
+  /**
+   * Optional callback fired synchronously after `launchServer` reports
+   * success and returned a `childPid`. Used by the bridge to register
+   * the spawned server's PID into its `selfSpawnedPgids` exclusion set
+   * BEFORE the next process-scan tick, so the dashboard's own server
+   * never surfaces in the session-card process list.
+   * See change: tighten-process-list-ux.
+   */
+  onServerSpawned?: (childPid: number) => void;
+  /**
+   * Optional predicate. When it returns true, the auto-start spawn step
+   * (step 3 below) is skipped — mDNS discovery + health check still run,
+   * so the bridge will pick up the orchestrator-spawned replacement as
+   * soon as it advertises. Used by the bridge to honor `server_restarting`
+   * bursts. See change: fix-restart-bridge-auto-start-race.
+   */
+  shouldSuppressAutoStart?: () => boolean;
+
+  // ── Test seams (production omits) ──────────────────────────────────────
+  /** Replace `resolveServerCliPath` (the worktree predicate's input). */
+  resolveCliPath?: () => string;
+  /** Directory holding `autostart-<port>.lock`. Defaults to `~/.pi/dashboard`. */
+  lockDir?: string;
+  /** Replace the OS liveness / start-time probes used for lock staleness. */
+  lockProbes?: LockProbes;
+  /** Replace the durable auto-start log sink. */
+  log?: (message: string) => void;
+  /** Spawn readiness budget (lock staleness bound + the loser's wait). */
+  readinessBudgetMs?: number;
+  /**
+   * Poll interval (ms) for the lock loser's bounded wait. Default 250.
+   *
+   * There is deliberately NO injectable `sleep` seam here: a stubbed
+   * immediately-resolving sleep turns the poll into a tight promise loop that
+   * starves the macrotask queue, so the holder's own timers never fire, the
+   * lock is never released, and the loser spins until the full budget elapses
+   * (30s per call — it stalled CI before this was understood). The wait must
+   * yield to real timers; shorten it with this interval instead.
+   */
+  lossPollIntervalMs?: number;
+}
+
+export interface AutoStartResult {
+  /** The server to connect to (if found or launched) */
+  server?: { host: string; port: number; piPort: number };
+}
+
+/**
+ * Opt-out gate for isolated / CI runs. When `PI_DASHBOARD_NO_MDNS` is truthy
+ * the bridge skips mDNS discovery entirely and binds to the explicit /
+ * configured URL via the health-check path. Mirrors the server's identical
+ * gate in `server.ts` (PI_DASHBOARD_NO_MDNS). Without this, a co-located real
+ * dashboard advertising on mDNS would be discovered here and override the
+ * bridge's explicit `PI_DASHBOARD_URL`, hijacking the connection off the
+ * isolated gateway. See change: resolve-global-prompt-templates-from-dashboard.
+ */
+function mdnsDisabled(): boolean {
+  const raw = (process.env.PI_DASHBOARD_NO_MDNS ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
+ * Discover or auto-start the dashboard server.
+ * Discovery chain: mDNS browse → health check fallback → auto-start.
+ * Returns the server to connect to.
+ */
+export async function autoStartServer(
+  config: { piPort: number; port: number; autoStart: boolean },
+  deps: AutoStartDeps,
+): Promise<AutoStartResult> {
+  const noMdns = mdnsDisabled();
+
+  // 1. Try mDNS discovery (2s timeout) — skipped when mDNS is disabled.
+  if (!noMdns) {
+    try {
+      const servers = await deps.discoverDashboard(2000);
+      const local = servers.find(s => s.isLocal);
+      if (local) {
+        return { server: { host: local.host, port: local.port, piPort: local.piPort } };
+      }
+      // Remote servers exist but no local — fall through to health check
+    } catch {
+      // mDNS failed — fall through to health check
+    }
+  }
+
+  // 2. Fallback: health check on configured port
+  const status = await deps.isDashboardRunning(config.port);
+  if (status.running) {
+    return { server: { host: "localhost", port: config.port, piPort: config.piPort } };
+  }
+
+  if (!config.autoStart) return {};
+
+  if (status.portConflict) {
+    deps.notify(`Port ${config.port} is occupied by another service`, "warning");
+    return {};
+  }
+
+  // Suppress the spawn step while a deliberate restart/shutdown is in
+  // flight. Discovery + health check above already ran, so if the
+  // orchestrator has finished bringing up the replacement we already
+  // returned. See change: fix-restart-bridge-auto-start-race.
+  if (deps.shouldSuppressAutoStart?.()) {
+    return {};
+  }
+
+  const log = deps.log ?? appendAutoStartLog;
+  const cliPath = (deps.resolveCliPath ?? resolveServerCliPath)();
+
+  // 3a. Worktree refusal (D3). Evaluated BEFORE lock acquisition (DR-10) and
+  // before `onLaunchStart` (D5), so a refusing session neither contends for
+  // the lock nor leaks a spinner. Keys on the resolved cliPath — which code
+  // would be spawned — never on cwd.
+  if (shouldRefuseWorktreeAutoStart({ cliPath, port: config.port, piPort: config.piPort })) {
+    log(
+      `refused: worktree checkout would take a shared default port ` +
+      `(cliPath=${cliPath} port=${config.port} piPort=${config.piPort})`,
+    );
+    // A toast is a bonus, not the requirement (D4) — and is absent headless.
+    try {
+      deps.notify(
+        `Dashboard auto-start refused: worktree checkout on shared port ${config.port}/${config.piPort}`,
+        "warning",
+      );
+    } catch { /* headless session with no UI (X2) */ }
+    return {};
+  }
+
+  // 3b. Single-flight lock (D2). Only the winner spawns.
+  const budgetMs = deps.readinessBudgetMs ?? SPAWN_READINESS_BUDGET_MS;
+  const probes = deps.lockProbes ?? defaultProbes();
+  const lock = acquireAutoStartLock(
+    { port: config.port, cliPath, dir: deps.lockDir },
+    probes,
+    budgetMs,
+  );
+  if (!lock.acquired) {
+    log(`lock held by session ${lock.holder?.sessionPid ?? "unknown"} — not spawning`);
+    // Wait for the holder, bounded by its readiness budget, then attach (X4)
+    // or report unavailable (X5). Never spawn, never throw.
+    //
+    // POLL, do not sleep the whole budget: the budget is the holder's WORST
+    // case, and a holder that finishes in a second must not cost every other
+    // session 30 idle seconds. Two exits end the wait early — the dashboard
+    // answering, or the holder releasing its lock.
+    const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+    const lockPath = autoStartLockPath(config.port, deps.lockDir);
+    const pollMs = Math.min(deps.lossPollIntervalMs ?? 250, budgetMs);
+    // Wait out the holder's REMAINING budget, not a fresh one: a lock taken
+    // 29s ago has one second left to live, and restarting the clock on every
+    // loser would let a stuck holder stall an unbounded number of sessions for
+    // a full budget each.
+    const heldSince = lock.holder?.startedAt ?? probes.now();
+    const deadline = Math.min(heldSince, probes.now()) + budgetMs;
+
+    let holderGone = false;
+    while (probes.now() < deadline) {
+      const probe = await deps.isDashboardRunning(config.port);
+      if (probe.running) {
+        return { server: { host: "localhost", port: config.port, piPort: config.piPort } };
+      }
+      if (readLock(lockPath) === null) { holderGone = true; break; }
+      await sleep(pollMs);
+    }
+
+    // Holder released without a dashboard coming up, or the budget elapsed:
+    // one last look, then report unavailable.
+    if (holderGone) {
+      const afterHolder = await deps.isDashboardRunning(config.port);
+      if (afterHolder.running) {
+        return { server: { host: "localhost", port: config.port, piPort: config.piPort } };
+      }
+    }
+    return {};
+  }
+  if (lock.degraded) {
+    log("lock directory unwritable — proceeding without single-flight");
+  }
+
+  try {
+    return await spawnAndAttach(config, deps, noMdns, {
+      lockDir: deps.lockDir,
+      locked: !lock.degraded,
+    });
+  } finally {
+    if (!lock.degraded) releaseAutoStartLock(config.port, deps.lockDir);
+  }
+}
+
+/**
+ * Step 3 proper: spawn the server and resolve the address to connect to.
+ * Extracted so the caller can wrap it in the lock's `finally` (E9 — the lock
+ * is released on ready, failed AND timed-out spawns alike).
+ */
+async function spawnAndAttach(
+  config: { piPort: number; port: number; autoStart: boolean },
+  deps: AutoStartDeps,
+  noMdns: boolean,
+  lockCtx: { lockDir?: string; locked: boolean },
+): Promise<AutoStartResult> {
+  deps.onLaunchStart?.();
+  let result: Awaited<ReturnType<AutoStartDeps["launchServer"]>>;
+  try {
+    result = await deps.launchServer(config);
+  } catch (err) {
+    // Production `launchServer` resolves rather than rejects, but the
+    // never-a-start-without-an-end invariant (F1/F2) must hold locally and
+    // not depend on the bridge's outer spinner net.
+    deps.onLaunchEnd?.(false);
+    throw err;
+  }
+  if (result.success) {
+    if (typeof result.childPid === "number" && result.childPid > 0) {
+      // Record the detached child so a concurrent session's staleness check
+      // sees a live spawn even if this session dies. Accepted gap: the
+      // primitive surfaces `childPid` only on readiness success, so the lock
+      // is childPid-less for the whole readiness window.
+      if (lockCtx.locked) recordChildPid(config.port, result.childPid, lockCtx.lockDir);
+      deps.onServerSpawned?.(result.childPid);
+    }
+    deps.onLaunchEnd?.(true);
+    deps.notify(`🌐 Dashboard started at http://localhost:${config.port}`, "info");
+
+    // Wait for mDNS advertisement from the newly started server (up to 10s).
+    // Skipped when mDNS is disabled — bind directly to the configured ports.
+    if (!noMdns) {
+      try {
+        const discovered = await deps.discoverDashboard(10000);
+        const local = discovered.find(s => s.isLocal);
+        if (local) {
+          return { server: { host: local.host, port: local.port, piPort: local.piPort } };
+        }
+      } catch {
+        // mDNS failed — use config defaults
+      }
+    }
+
+    return { server: { host: "localhost", port: config.port, piPort: config.piPort } };
+  }
+
+  // Another agent may have started the server concurrently — recheck before warning
+  const recheck = await deps.isDashboardRunning(config.port);
+  if (recheck.running) {
+    deps.onLaunchEnd?.(true);
+    return { server: { host: "localhost", port: config.port, piPort: config.piPort } };
+  }
+
+  // Surface the log path so users can inspect the crash output without having
+  // to know the convention. The bridge auto-spawn owns this file when the spawn
+  // reached the log-owning path (stdio:{logFile}); only failures that abort
+  // before the log fd opens (JitiNotFoundError → logOwned:false) skip the
+  // suffix, so we never point users at a server.log that was never written.
+  // See change: fix-windows-server-parity, fix-bridge-server-start-diagnostics.
+  deps.onLaunchEnd?.(false);
+  const logSuffix = result.logOwned === false ? "" : `\nSee log: ${getDashboardServerLogPath()}`;
+  deps.notify(
+    `Dashboard server failed to start: ${result.message}${logSuffix}`,
+    "warning",
+  );
+  return {};
+}

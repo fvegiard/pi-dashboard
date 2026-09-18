@@ -1,0 +1,10 @@
+{
+  "name": "pi-dashboard-bundled-server",
+  "private": true,
+  "workspaces": [
+    "packages/server",
+    "packages/shared",
+    "packages/extension",
+    "packages/dashboard-plugin-runtime"
+  ]
+}
